@@ -23,8 +23,10 @@ async function vistaLinks(ctx) {
   nextDue = Math.min(Infinity, ...ev.filter(e => ids.has(String(e.profile_gid)) && /SCHEDULED|PROCESSING|APPROVED|REVIEW/.test(e.status))
     .map(e => +e.publish_at_time).filter(t => t > now - 30*60e3));
   return ev.filter(e => e.status === 'PUBLISHED' && e.result?.published_link)
-    .map(e => ({ profile: +e.profile_gid, link: e.result.published_link,
-                 live: Date.parse(e.result.published_at || '') || +e.publish_at_time }))
+    .map(e => { const link = e.result.published_link; const tt = link.match(/tiktok\.com\/@[^/]+\/video\/(\d+)/);
+      if (/tiktok\.com/.test(link) && !tt) return null; // profile-only link: video not ready yet
+      const live = tt ? Number(BigInt(tt[1]) >> 32n) * 1000 : (Date.parse(e.result.published_at || '') || +e.publish_at_time);
+      return { profile: +e.profile_gid, link, live }; }).filter(Boolean)
     .filter(e => now - e.live < WINDOW_MIN * 60e3 && now - e.live > -60e3);
 }
 function saveLog() { if (!process.env.GITHUB_ACTIONS) return; try { require('child_process').execSync('git add -f submitted.log && git commit -qm log && (git push -q || (git pull -q --rebase && git push -q))', { stdio: 'ignore' }); } catch {} }
