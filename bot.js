@@ -10,7 +10,7 @@ const CAMPAIGNS = [
 const ENTITY_IDS = '3f972620-e50a-11f1-a33e-81c466c1e067,cf51f540-e1d3-11f1-905a-196ceb9e190b,a4893300-e1d3-11f1-b7d5-835374bce5b6,dddc08d0-e1d3-11f1-a025-4d6af26820fd,5027a300-e1d3-11f1-988c-89194c44b0b5';
 const WINDOW_MIN = 28, DRY = process.env.DRY_RUN === '1';
 const LOG = 'submitted.log'; const done = new Set(fs.existsSync(LOG) ? fs.readFileSync(LOG,'utf8').split('\n').map(l=>l.split(' ').pop()) : []);
-const out = []; let nextDue = Infinity; const pt = d => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+const out = []; let nextDue = Infinity; const _push = out.push.bind(out); out.push = (...a) => { a.forEach(x=>console.log(new Date().toISOString(), x)); return _push(...a); }; const pt = d => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
 
 async function vistaLinks(ctx) {
   const now = Date.now();
@@ -50,9 +50,10 @@ async function submit(p, c, link) {
   const ctx = cdp ? b.contexts()[0] : await b.newContext({ storageState: JSON.parse(process.env.STATE_JSON || fs.readFileSync('state.json','utf8')) });
   const p = await ctx.newPage(); p.setDefaultTimeout(15000); let fail = false;
   const end = Date.now() + (+process.env.LOOP_MIN || 0) * 60e3;
+  let tick = 0;
   do {
     try {
-      const posts = await vistaLinks(ctx);
+      const posts = await vistaLinks(ctx); if (!(++tick % 10)) console.log(new Date().toISOString(), 'alive, live posts:', posts.length, 'logged:', done.size);
       for (const post of posts) {
         const c = CAMPAIGNS.find(c => c.profiles.includes(post.profile)); if (!c || done.has(post.link)) continue;
         if (DRY) { out.push(`DRY would submit to ${c.name}: ${post.link}`); done.add(post.link); continue; }
