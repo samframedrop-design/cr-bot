@@ -60,7 +60,6 @@ async function submit(p, c, link) {
         catch (e) { fail = true; out.push(`FAILED ${c.name} ${post.link}: ${e.message.split('\n')[0]}`); await p.screenshot({ path: `fail-${Date.now()}.png` }).catch(()=>{}); }
       }
     } catch (e) { fail = true; out.push('FAILED: ' + e.message.split('\n')[0]); }
-    if (nextDue - Date.now() > 75*60e3) { const idle = await vistaLinks(ctx).then(x=>x.filter(e=>!done.has(e.link)).length); if (!idle) { out.push('No posts due in next 75 min - stopping (hourly backup restarts it).'); fs.writeFileSync('idle', '1'); break; } }
     if (Date.now() < end) { await p.waitForTimeout(30000); if (out.length > 200) out.splice(0, 100); }
   } while (Date.now() < end);
   if (!out.length) out.push('nothing new');
