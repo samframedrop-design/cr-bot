@@ -1,0 +1,6 @@
+node_modules
+chrome-profile
+state.json
+*.png
+dialog-*.html
+report.txt
