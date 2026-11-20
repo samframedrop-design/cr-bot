@@ -42,16 +42,20 @@ async function submit(p, c, link) {
   const b = cdp ? await chromium.connectOverCDP(cdp) : await chromium.launch();
   const ctx = cdp ? b.contexts()[0] : await b.newContext({ storageState: JSON.parse(process.env.STATE_JSON || fs.readFileSync('state.json','utf8')) });
   const p = await ctx.newPage(); p.setDefaultTimeout(15000); let fail = false;
-  try {
-    const posts = await vistaLinks(ctx); out.push(`Vista: ${posts.length} post(s) live in last ${WINDOW_MIN} min`);
-    for (const post of posts) {
-      const c = CAMPAIGNS.find(c => c.profiles.includes(post.profile)); if (!c) continue;
-      if (done.has(post.link)) { out.push(`skip (already submitted) ${post.link}`); continue; }
-      if (DRY) { out.push(`DRY would submit to ${c.name}: ${post.link}`); continue; }
-      try { await submit(p, c, post.link); fs.appendFileSync(LOG, `${new Date().toISOString()} ${c.name} ${post.link}\n`); out.push(`SUBMITTED to ${c.name}: ${post.link}`); }
-      catch (e) { fail = true; out.push(`FAILED ${c.name} ${post.link}: ${e.message.split('\n')[0]}`); await p.screenshot({ path: `fail-${Date.now()}.png` }).catch(()=>{}); }
-    }
-  } catch (e) { fail = true; out.push('FAILED: ' + e.message.split('\n')[0]); }
+  const end = Date.now() + (+process.env.LOOP_MIN || 0) * 60e3;
+  do {
+    try {
+      const posts = await vistaLinks(ctx);
+      for (const post of posts) {
+        const c = CAMPAIGNS.find(c => c.profiles.includes(post.profile)); if (!c || done.has(post.link)) continue;
+        if (DRY) { out.push(`DRY would submit to ${c.name}: ${post.link}`); done.add(post.link); continue; }
+        try { await submit(p, c, post.link); done.add(post.link); fs.appendFileSync(LOG, `${new Date().toISOString()} ${c.name} ${post.link}\n`); out.push(`SUBMITTED to ${c.name}: ${post.link}`); }
+        catch (e) { fail = true; out.push(`FAILED ${c.name} ${post.link}: ${e.message.split('\n')[0]}`); await p.screenshot({ path: `fail-${Date.now()}.png` }).catch(()=>{}); }
+      }
+    } catch (e) { fail = true; out.push('FAILED: ' + e.message.split('\n')[0]); }
+    if (Date.now() < end) await p.waitForTimeout(30000);
+  } while (Date.now() < end);
+  if (!out.length) out.push('nothing new');
   console.log(out.join('\n')); fs.writeFileSync('report.txt', out.join('\n'));
   await p.close(); if (!cdp) await b.close(); process.exit(fail ? 1 : 0);
 })();
