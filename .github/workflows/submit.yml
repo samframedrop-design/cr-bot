@@ -4,6 +4,7 @@ name: submit-clips
 on:
   schedule: [{ cron: '7 * * * *' }]
   workflow_dispatch: {}
+  push: { paths: ['start.txt'] }
 permissions: { contents: write, actions: write }
 concurrency: { group: submit, cancel-in-progress: false }
 jobs:
