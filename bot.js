@@ -1,53 +1,57 @@
-// Content Rewards auto-submitter. Runs headless in GitHub Actions using saved login (STATE_JSON).
-const { chromium } = require('playwright');
-const fs = require('fs');
+// Cloud bot: every run, read posts that went live in the last 30 min from Vista Social,
+// then paste each link into the matching Content Rewards campaign. Never resubmits a link (submitted.log).
+const { chromium } = require('playwright'); const fs = require('fs');
 const CAMPAIGNS = [
   { name: 'KreekCraft', url: 'https://contentrewards.com/c/campaigns/2eaa14fb-6927-4136-897e-b096e0d907d6',
-    handles: ['finalboss_clips','final.boss.clips0','finalbossclips0','finalbossclips1','finalbossclips.1',
-              'golden.hour.gamin','golden.hour.gamin4','golden.hour.clipa','goldenhourclips-o6e','goldenhourclips-q8t','goldenhourclips-m7s'] },
-  { name: 'Brett', url: 'https://contentrewards.com/c/campaigns/954cf1f2-1a69-4f0f-b46c-18a9dfddb219',
-    handles: ['hypeframetv1.0'] },
+    profiles: [847128,847051,847137,847115,847138,847050,847139,847116,847119,847117,847120,847118,847121] },
+  { name: 'Brett', url: 'https://contentrewards.com/c/campaigns/954cf1f2-1a69-4f0f-b46c-18a9dfddb219', profiles: [850136] },
 ];
-const DRY = process.env.DRY_RUN === '1';
-const out = [];
-async function dismiss(p) {
-  for (const n of [/^not now$/i, /^skip for now$/i, /^decline$/i]) {
-    const b = p.getByRole('button', { name: n }); if (await b.count()) await b.first().click().catch(()=>{});
-  }
+const ENTITY_IDS = '3f972620-e50a-11f1-a33e-81c466c1e067,cf51f540-e1d3-11f1-905a-196ceb9e190b,a4893300-e1d3-11f1-b7d5-835374bce5b6,dddc08d0-e1d3-11f1-a025-4d6af26820fd,5027a300-e1d3-11f1-988c-89194c44b0b5';
+const WINDOW_MIN = 28, DRY = process.env.DRY_RUN === '1';
+const LOG = 'submitted.log'; const done = new Set(fs.existsSync(LOG) ? fs.readFileSync(LOG,'utf8').split('\n').map(l=>l.split(' ').pop()) : []);
+const out = []; const pt = d => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
+
+async function vistaLinks(ctx) {
+  const now = Date.now();
+  const r = await ctx.request.post('https://vistasocial.com/api/publishing/calendar/get-calendar', { data: {
+    timezone: 'America/Los_Angeles', centralDate: '', dateFrom: pt(now - 864e5), dateTo: pt(now + 864e5),
+    profileIds: CAMPAIGNS.flatMap(c=>c.profiles).join(','), entityIds: ENTITY_IDS } });
+  if (!r.ok()) throw new Error(`Vista ${r.status()} - Vista login expired? re-run setup`);
+  const ev = (await r.json()).events || [];
+  return ev.filter(e => e.status === 'PUBLISHED' && e.result?.published_link)
+    .map(e => ({ profile: +e.profile_gid, link: e.result.published_link,
+                 live: Date.parse(e.result.published_at || '') || +e.publish_at_time }))
+    .filter(e => now - e.live < WINDOW_MIN * 60e3 && now - e.live > -60e3);
 }
-async function run(p, c) {
-  await p.goto(c.url, { waitUntil: 'domcontentloaded' }); await p.waitForTimeout(4000); await dismiss(p);
-  if (/sign in|log in/i.test(await p.locator('body').innerText()) && !(await p.getByText('Submit clip').count()))
-    throw new Error('LOGGED OUT - re-run login and update STATE_JSON secret');
-  await p.getByText('Submit clip', { exact: true }).last().click(); await p.waitForTimeout(5000);
-  const dlg = p.locator('[role=dialog]').filter({ hasText: /requirements/i }).last();
-  const text = await dlg.innerText();
-  if (/no new clips yet/i.test(text)) { out.push(`${c.name}: no new clips`); return; }
-  if (DRY) { fs.writeFileSync(`dialog-${c.name}.html`, await dlg.innerHTML()); await p.screenshot({ path: `dialog-${c.name}.png` }); }
-  // Each clip is a selectable item; pick only items mentioning this campaign's handles.
-  const items = dlg.locator('label, [role=checkbox], [role=option], button').filter({ hasNotText: /requirements|submit clip|open (tiktok|instagram|youtube)|can't be submitted/i });
-  const n = await items.count(); let picked = [];
-  for (let i = 0; i < n; i++) {
-    const it = items.nth(i); const t = (await it.innerText().catch(()=>'')).toLowerCase();
-    const h = c.handles.find(x => new RegExp(`(^|[^a-z0-9._-])@?${x.replace(/\./g,'\\.')}($|[^a-z0-9._-])`).test(t));
-    if (!h) continue;
-    picked.push(t.replace(/\s+/g,' ').slice(0,80));
-    if (!DRY) await it.click();
-  }
-  if (!picked.length) { out.push(`${c.name}: new clips listed but none from this campaign's accounts`); return; }
-  if (DRY) { out.push(`${c.name}: DRY RUN would submit ${picked.length}: ${picked.join(' | ')}`); return; }
-  await dlg.getByText(/I've read the requirements/i).click();
-  await dlg.getByRole('button', { name: /submit/i }).last().click(); await p.waitForTimeout(5000);
-  const done = p.getByRole('button', { name: /^done$/i }); if (await done.count()) await done.first().click();
-  await dismiss(p);
-  out.push(`${c.name}: SUBMITTED ${picked.length}: ${picked.join(' | ')}`);
+async function closePopups(p) { for (const n of [/^not now$/i,/^skip for now$/i,/^decline$/i]) { const x=p.getByRole('button',{name:n}); if (await x.count()) await x.first().click().catch(()=>{}); } }
+async function submit(p, c, link) {
+  await p.goto(c.url); await p.waitForTimeout(3500); await closePopups(p);
+  const btn = p.getByText('Submit clip', { exact: true }).last();
+  if (!(await btn.count())) throw new Error('Content Rewards logged out - re-run setup');
+  await btn.click(); await p.waitForTimeout(3000);
+  const inp = p.getByPlaceholder(/paste a link/i); await inp.fill(link); await inp.press('Enter').catch(()=>{}); await p.waitForTimeout(3500);
+  await p.getByText(/I've read the requirements/i).last().click(); await p.waitForTimeout(800);
+  const sb = p.getByRole('button', { name: /^submit/i }).last();
+  if (!(await sb.isEnabled())) throw new Error('Submit disabled: ' + (await p.locator('[role=dialog]').last().innerText()).slice(0,200).replace(/\n/g,' '));
+  await sb.click(); await p.waitForTimeout(4000);
+  const d = p.getByRole('button', { name: /^done$/i }); if (await d.count()) await d.first().click();
+  await closePopups(p);
 }
 (async () => {
   const cdp = process.env.CDP;
   const b = cdp ? await chromium.connectOverCDP(cdp) : await chromium.launch();
   const ctx = cdp ? b.contexts()[0] : await b.newContext({ storageState: JSON.parse(process.env.STATE_JSON || fs.readFileSync('state.json','utf8')) });
-  const p = await ctx.newPage(); let fail = false;
-  for (const c of CAMPAIGNS) { try { await run(p, c); } catch (e) { fail = true; out.push(`${c.name}: FAILED ${e.message}`); await p.screenshot({ path: `fail-${c.name}.png` }).catch(()=>{}); } }
+  const p = await ctx.newPage(); p.setDefaultTimeout(15000); let fail = false;
+  try {
+    const posts = await vistaLinks(ctx); out.push(`Vista: ${posts.length} post(s) live in last ${WINDOW_MIN} min`);
+    for (const post of posts) {
+      const c = CAMPAIGNS.find(c => c.profiles.includes(post.profile)); if (!c) continue;
+      if (done.has(post.link)) { out.push(`skip (already submitted) ${post.link}`); continue; }
+      if (DRY) { out.push(`DRY would submit to ${c.name}: ${post.link}`); continue; }
+      try { await submit(p, c, post.link); fs.appendFileSync(LOG, `${new Date().toISOString()} ${c.name} ${post.link}\n`); out.push(`SUBMITTED to ${c.name}: ${post.link}`); }
+      catch (e) { fail = true; out.push(`FAILED ${c.name} ${post.link}: ${e.message.split('\n')[0]}`); await p.screenshot({ path: `fail-${Date.now()}.png` }).catch(()=>{}); }
+    }
+  } catch (e) { fail = true; out.push('FAILED: ' + e.message.split('\n')[0]); }
   console.log(out.join('\n')); fs.writeFileSync('report.txt', out.join('\n'));
   await p.close(); if (!cdp) await b.close(); process.exit(fail ? 1 : 0);
 })();
