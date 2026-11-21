@@ -54,7 +54,7 @@ async function campaignForTag(p, tag) {
   const id = tag.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
   if (id) return { name: tag, url: `https://contentrewards.com/c/campaigns/${id[0]}` };
   if (campCache[tag] !== undefined) return campCache[tag];
-  await p.goto('https://contentrewards.com/c/campaigns'); await p.waitForTimeout(4000);
+  await p.goto('https://contentrewards.com/c/campaigns'); await p.waitForTimeout(4000); await closePopups(p);
   const body = await p.locator('main').innerText(); const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
   const cand = [...new Set(lines.filter(l => l.length > 6 && norm(l).includes(norm(tag)) && !/submit clip/i.test(l)))];
   if (cand.length !== 1) { campCache[tag] = null; out.push(`TAG "${tag}": ${cand.length ? 'matches several campaigns: ' + cand.join(' / ') : 'matches no joined campaign'} - not submitted`); return null; }
@@ -63,7 +63,7 @@ async function campaignForTag(p, tag) {
   return campCache[tag];
 }
 async function pickCampaign(p, post) {
-  for (const t of post.tags) { const c = await campaignForTag(p, t); if (c) return c; }
+  for (const t of post.tags) { try { const c = await campaignForTag(p, t); if (c) return c; } catch (e) { out.push(`tag lookup error "${t}": ${e.message.split('\n')[0]}`); await p.screenshot({ path: `tagfail-${Date.now()}.png` }).catch(()=>{}); } }
   return CAMPAIGNS.find(c => c.profiles.includes(post.profile)) || null; // untagged: old fixed list
 }
 function saveLog() { if (!process.env.GITHUB_ACTIONS) return; try { require('child_process').execSync('git add -f submitted.log && git commit -qm log && (git push -q || (git pull -q --rebase && git push -q))', { stdio: 'ignore' }); } catch {} }
