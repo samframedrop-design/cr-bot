@@ -18,6 +18,7 @@ const CAMPAIGNS = [
   { name: 'KreekCraft', url: 'https://contentrewards.com/c/campaigns/2eaa14fb-6927-4136-897e-b096e0d907d6',
     profiles: [847128,847051,847137,847115,847138,847050,847139,847116,847119,847117,847120,847118,847121] },
   { name: 'Diego', url: 'https://contentrewards.com/c/campaigns/5d37d3dd-adf3-401f-9c62-24bb54d5087a', profiles: [850559,850560,850561] },
+  { name: 'Parker', url: 'https://contentrewards.com/c/campaigns/e41de449-3eca-4343-a11c-b194e7a3379a', profiles: [847045,850798] }, // Clip Nuke
   { name: 'Brett', url: 'https://contentrewards.com/c/campaigns/954cf1f2-1a69-4f0f-b46c-18a9dfddb219', profiles: [850136] },
 ];
 const ENTITY_IDS = '3f972620-e50a-11f1-a33e-81c466c1e067,cf51f540-e1d3-11f1-905a-196ceb9e190b,a4893300-e1d3-11f1-b7d5-835374bce5b6,dddc08d0-e1d3-11f1-a025-4d6af26820fd,5027a300-e1d3-11f1-988c-89194c44b0b5';
