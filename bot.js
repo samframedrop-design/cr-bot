@@ -67,19 +67,60 @@ async function pickCampaign(p, post) {
   return CAMPAIGNS.find(c => c.profiles.includes(post.profile)) || null; // untagged: old fixed list
 }
 function saveLog() { if (!process.env.GITHUB_ACTIONS) return; try { require('child_process').execSync('git add -f submitted.log && git commit -qm log && (git push -q || (git pull -q --rebase && git push -q))', { stdio: 'ignore' }); } catch {} }
-async function closePopups(p) { for (const n of [/^not now$/i,/^skip for now$/i,/^decline$/i]) { const x=p.getByRole('button',{name:n}); if (await x.count()) await x.first().click().catch(()=>{}); } }
+const POPUP_BTN = /^(not now|skip( for now)?|maybe later|no,? thanks|dismiss|close|decline|reject( all)?|got it|ok(ay)?|continue|later|cancel)$/i;
+// Close anything that is not the submit box: cookie banners, Discord prompts, announcements, tours.
+async function closePopups(p, keep) {
+  for (let round = 0; round < 3; round++) {
+    let closed = false;
+    for (const d of await p.locator('[role=dialog], [role=alertdialog], [aria-modal=true], [class*=modal i], [class*=popup i], [class*=toast i], [class*=banner i]').all()) {
+      if (!(await d.isVisible().catch(() => false))) continue;
+      const t = (await d.innerText().catch(() => '')).toLowerCase();
+      if (keep && keep.test(t)) continue;
+      for (const btn of await d.locator('button, [role=button], a').all()) {
+        const label = ((await btn.innerText().catch(() => '')) || (await btn.getAttribute('aria-label').catch(() => '')) || '').trim();
+        if (POPUP_BTN.test(label) || /^(close|dismiss)/i.test(await btn.getAttribute('aria-label').catch(() => '') || '')) { await btn.click({ timeout: 3000 }).catch(() => {}); closed = true; break; }
+      }
+    }
+    if (!closed) break; await p.waitForTimeout(700);
+  }
+}
+const SUBMIT_BOX = /paste a link|requirements|submit/i;
+async function clickSmart(p, loc) { // normal click, then press-and-hold if the button needs holding
+  const box = await loc.boundingBox(); const label = (await loc.innerText().catch(() => '')).toLowerCase();
+  if (/hold/.test(label) && box) { await p.mouse.move(box.x + box.width / 2, box.y + box.height / 2); await p.mouse.down(); await p.waitForTimeout(4000); await p.mouse.up(); return; }
+  await loc.click({ timeout: 8000 }).catch(async () => { await loc.click({ force: true, timeout: 5000 }); });
+}
+async function findOne(scope, list) { for (const l of list) { const x = scope.locator(l).filter({ visible: true }); if (await x.count()) return x.last(); } return null; }
 async function submit(p, c, link) {
   await p.goto(c.url); await p.waitForTimeout(3500); await closePopups(p);
-  const btn = p.getByText('Submit clip', { exact: true }).last();
-  if (!(await btn.count())) throw new Error('Content Rewards logged out - re-run setup');
-  await btn.click(); await p.waitForTimeout(3000);
-  const inp = p.getByPlaceholder(/paste a link/i); await inp.fill(link); await inp.press('Enter').catch(()=>{}); await p.waitForTimeout(3500);
-  await p.getByText(/I've read the requirements/i).last().click(); await p.waitForTimeout(800);
-  const sb = p.getByRole('button', { name: /^submit/i }).last();
-  if (!(await sb.isEnabled())) throw new Error('Submit disabled: ' + (await p.locator('[role=dialog]').last().innerText()).slice(0,200).replace(/\n/g,' '));
-  await sb.click(); await p.waitForTimeout(4000);
-  const d = p.getByRole('button', { name: /^done$/i }); if (await d.count()) await d.first().click();
+  if (/sign in|log in|continue with google/i.test(await p.locator('body').innerText()) && !(await p.getByText(/submit/i).count())) throw new Error('Content Rewards logged out - needs new sign-in');
+  const opener = await findOne(p, ['button:has-text("Submit clip")', 'a:has-text("Submit clip")', 'text=/^submit (a )?(clip|video|post|content)$/i', 'button:has-text("Submit")']);
+  if (!opener) throw new Error('no Submit button on campaign page');
+  await clickSmart(p, opener); await p.waitForTimeout(3000); await closePopups(p, SUBMIT_BOX);
+  const dlg = (await findOne(p, ['[role=dialog]:has-text("link")', '[role=dialog]:has-text("requirements")', '[aria-modal=true]'])) || p.locator('body');
+  const inp = await findOne(dlg, ['input[placeholder*="link" i]', 'input[placeholder*="url" i]', 'input[type=url]', 'textarea', 'input[type=text]']);
+  if (!inp) throw new Error('no link box in submit dialog');
+  await inp.fill(link); await inp.press('Enter').catch(() => {}); await p.waitForTimeout(3500); await closePopups(p, SUBMIT_BOX);
+  // tick every unticked agreement box
+  for (const cb of await dlg.locator('input[type=checkbox], [role=checkbox]').all()) {
+    const on = (await cb.getAttribute('aria-checked').catch(() => null)) === 'true' || (await cb.isChecked().catch(() => false));
+    if (!on) await cb.click({ force: true, timeout: 4000 }).catch(() => {});
+  }
+  const agree = dlg.getByText(/I've read|requirements|I agree|accept/i).last();
+  if (!(await dlg.locator('[aria-checked=true], input[type=checkbox]:checked').count()) && await agree.count()) await agree.click().catch(() => {});
+  await p.waitForTimeout(800);
+  const btn = await findOne(dlg, ['button:has-text("Submit clip")', 'button:has-text("Hold")', 'button:has-text("Submit")', 'button[type=submit]']);
+  if (!btn) throw new Error('no final Submit button');
+  if (!(await btn.isEnabled())) throw new Error('Submit disabled: ' + (await dlg.innerText()).slice(0, 200).replace(/\n/g, ' '));
+  if (process.env.SUBMIT_TEST) return 'test-ok';
+  await clickSmart(p, btn); await p.waitForTimeout(5000);
+  const after = (await p.locator('body').innerText()).toLowerCase();
+  const done = p.getByRole('button', { name: /^(done|close|ok|got it)$/i }); if (await done.count()) await done.first().click().catch(() => {});
   await closePopups(p);
+  if (/already (been )?submitted|duplicate/.test(after)) return 'already';
+  if (/too old|expired|older than|30 minutes/.test(after) && !/you have 30 minutes/.test(after)) throw new Error('rejected as too old');
+  if (/error|failed|try again|something went wrong/.test(after) && await inp.isVisible().catch(() => false)) throw new Error('Content Rewards showed an error after submit');
+  return 'ok';
 }
 (async () => {
   const cdp = process.env.CDP;
@@ -96,7 +137,7 @@ async function submit(p, c, link) {
       for (const post of posts) {
         if (done.has(post.link)) continue; const c = await pickCampaign(p, post); if (!c) { out.push(`no campaign for ${post.link} (tags: ${post.tags.join(',')||'none'})`); done.add(post.link); continue; }
         if (DRY) { out.push(`DRY would submit to ${c.name}: ${post.link}`); done.add(post.link); continue; }
-        try { await submit(p, c, post.link); done.add(post.link); fs.appendFileSync(LOG, `${new Date().toISOString()} ${c.name} ${post.link}\n`); saveLog(); out.push(`SUBMITTED to ${c.name}: ${post.link}`); }
+        try { const res = await submit(p, c, post.link); done.add(post.link); if (res === 'already') out.push('(Content Rewards says already submitted)'); fs.appendFileSync(LOG, `${new Date().toISOString()} ${c.name} ${post.link}\n`); saveLog(); out.push(`SUBMITTED to ${c.name}: ${post.link}`); }
         catch (e) { fail = true; out.push(`FAILED ${c.name} ${post.link}: ${e.message.split('\n')[0]}`); await p.screenshot({ path: `fail-${Date.now()}.png` }).catch(()=>{}); }
       }
     } catch (e) { fail = true; out.push('FAILED: ' + e.message.split('\n')[0]); }
