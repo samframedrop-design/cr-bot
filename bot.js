@@ -25,22 +25,45 @@ const WINDOW_MIN = 28, DRY = process.env.DRY_RUN === '1';
 const LOG = 'submitted.log'; const done = new Set(fs.existsSync(LOG) ? fs.readFileSync(LOG,'utf8').split('\n').map(l=>l.split(' ').pop()) : []);
 const out = []; let nextDue = Infinity; const _push = out.push.bind(out); out.push = (...a) => { a.forEach(x=>console.log(new Date().toISOString(), x)); return _push(...a); }; const pt = d => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
 
+let TAGS = []; // [{id,name}]
 async function vistaLinks(ctx) {
   const now = Date.now();
-  const r = await ctx.request.post('https://vistasocial.com/api/publishing/calendar/get-calendar', { data: {
-    timezone: 'America/Los_Angeles', centralDate: '', dateFrom: pt(now - 864e5), dateTo: pt(now + 864e5),
-    profileIds: CAMPAIGNS.flatMap(c=>c.profiles).join(','), entityIds: ENTITY_IDS } });
-  const ct = r.headers()['content-type'] || ''; if (!r.ok() || !ct.includes('json')) throw new Error(`Vista login expired (status ${r.status()}) - needs new sign-in`);
-  const ev = (await r.json()).events || [];
-  const ids = new Set(CAMPAIGNS.flatMap(c=>c.profiles).map(String));
-  nextDue = Math.min(Infinity, ...ev.filter(e => ids.has(String(e.profile_gid)) && /SCHEDULED|PROCESSING|APPROVED|REVIEW/.test(e.status))
-    .map(e => +e.publish_at_time).filter(t => t > now - 30*60e3));
+  let entityIds = ENTITY_IDS;
+  try { const e = await (await ctx.request.get('https://vistasocial.com/api/entities?page=calendar')).json(); if (e.entities?.length) entityIds = e.entities.map(x => x.id).join(','); } catch {}
+  try { const t = await (await ctx.request.get('https://vistasocial.com/api/tag?surface=PUBLICATION')).json(); if (Array.isArray(t)) TAGS = t.map(x => ({ id: x._id, name: x.name })); } catch {}
+  const body = { timezone: 'America/Los_Angeles', centralDate: '', dateFrom: pt(now - 864e5), dateTo: pt(now + 864e5), entityIds };
+  let r = await ctx.request.post('https://vistasocial.com/api/publishing/calendar/get-calendar', { data: { ...body, profileIds: '' } });
+  let ct = r.headers()['content-type'] || '';
+  let ev = (r.ok() && ct.includes('json')) ? ((await r.json()).events || []).filter(e => e.profile_gid) : [];
+  if (!ev.length) { r = await ctx.request.post('https://vistasocial.com/api/publishing/calendar/get-calendar', { data: { ...body, profileIds: CAMPAIGNS.flatMap(c=>c.profiles).join(',') } });
+    ct = r.headers()['content-type'] || ''; if (!r.ok() || !ct.includes('json')) throw new Error(`Vista login expired (status ${r.status()}) - needs new sign-in`);
+    ev = (await r.json()).events || []; }
   return ev.filter(e => e.status === 'PUBLISHED' && e.result?.published_link)
     .map(e => { const link = e.result.published_link; const tt = link.match(/tiktok\.com\/@[^/]+\/video\/(\d+)/);
-      if (/tiktok\.com/.test(link) && !tt) return null; // profile-only link: video not ready yet
+      if (/tiktok\.com/.test(link) && !tt) return null;
       const live = tt ? Number(BigInt(tt[1]) >> 32n) * 1000 : (Date.parse(e.result.published_at || '') || +e.publish_at_time);
-      return { profile: +e.profile_gid, link, live }; }).filter(Boolean)
+      const js = JSON.stringify(e); const tags = TAGS.filter(t => js.includes(`"${t.id}"`) || js.includes(`"${t.name}"`)).map(t => t.name);
+      return { profile: +e.profile_gid, link, live, tags }; }).filter(Boolean)
     .filter(e => now - e.live < WINDOW_MIN * 60e3 && now - e.live > -60e3);
+}
+// Campaign lookup by tag: tag = campaign link/ID, or a word from the campaign title (must match exactly one joined campaign).
+const campCache = {};
+const norm = x => x.toLowerCase().replace(/[^a-z0-9]/g, '');
+async function campaignForTag(p, tag) {
+  const id = tag.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+  if (id) return { name: tag, url: `https://contentrewards.com/c/campaigns/${id[0]}` };
+  if (campCache[tag] !== undefined) return campCache[tag];
+  await p.goto('https://contentrewards.com/c/campaigns'); await p.waitForTimeout(4000);
+  const body = await p.locator('main').innerText(); const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
+  const cand = [...new Set(lines.filter(l => l.length > 6 && norm(l).includes(norm(tag)) && !/submit clip/i.test(l)))];
+  if (cand.length !== 1) { campCache[tag] = null; out.push(`TAG "${tag}": ${cand.length ? 'matches several campaigns: ' + cand.join(' / ') : 'matches no joined campaign'} - not submitted`); return null; }
+  await p.getByText(cand[0], { exact: true }).first().click(); await p.waitForTimeout(4000);
+  const m = p.url().match(/campaigns\/([0-9a-f-]{36})/); campCache[tag] = m ? { name: cand[0], url: `https://contentrewards.com/c/campaigns/${m[1]}` } : null;
+  return campCache[tag];
+}
+async function pickCampaign(p, post) {
+  for (const t of post.tags) { const c = await campaignForTag(p, t); if (c) return c; }
+  return CAMPAIGNS.find(c => c.profiles.includes(post.profile)) || null; // untagged: old fixed list
 }
 function saveLog() { if (!process.env.GITHUB_ACTIONS) return; try { require('child_process').execSync('git add -f submitted.log && git commit -qm log && (git push -q || (git pull -q --rebase && git push -q))', { stdio: 'ignore' }); } catch {} }
 async function closePopups(p) { for (const n of [/^not now$/i,/^skip for now$/i,/^decline$/i]) { const x=p.getByRole('button',{name:n}); if (await x.count()) await x.first().click().catch(()=>{}); } }
@@ -63,13 +86,14 @@ async function submit(p, c, link) {
   if (process.argv[2] === 'encrypt') { fs.writeFileSync('state.enc', encState(JSON.parse(fs.readFileSync(process.argv[3],'utf8')))); console.log('encrypted'); process.exit(0); }
   const ctx = cdp ? b.contexts()[0] : await b.newContext({ storageState: loadState() });
   const p = await ctx.newPage(); p.setDefaultTimeout(15000); let fail = false;
+  for (const sig of ['SIGTERM','SIGINT']) process.on(sig, async () => { await saveState(ctx); process.exit(1); });
   const end = Date.now() + (+process.env.LOOP_MIN || 0) * 60e3;
   let tick = 0;
   do {
     try {
       const posts = await vistaLinks(ctx); if (!(++tick % 10)) { await saveState(ctx); } if (!(tick % 10)) console.log(new Date().toISOString(), 'alive, live posts:', posts.length, 'logged:', done.size);
       for (const post of posts) {
-        const c = CAMPAIGNS.find(c => c.profiles.includes(post.profile)); if (!c || done.has(post.link)) continue;
+        if (done.has(post.link)) continue; const c = await pickCampaign(p, post); if (!c) { out.push(`no campaign for ${post.link} (tags: ${post.tags.join(',')||'none'})`); done.add(post.link); continue; }
         if (DRY) { out.push(`DRY would submit to ${c.name}: ${post.link}`); done.add(post.link); continue; }
         try { await submit(p, c, post.link); done.add(post.link); fs.appendFileSync(LOG, `${new Date().toISOString()} ${c.name} ${post.link}\n`); saveLog(); out.push(`SUBMITTED to ${c.name}: ${post.link}`); }
         catch (e) { fail = true; out.push(`FAILED ${c.name} ${post.link}: ${e.message.split('\n')[0]}`); await p.screenshot({ path: `fail-${Date.now()}.png` }).catch(()=>{}); }
