@@ -1,6 +1,19 @@
 // Cloud bot: every run, read posts that went live in the last 30 min from Vista Social,
 // then paste each link into the matching Content Rewards campaign. Never resubmits a link (submitted.log).
-const { chromium } = require('playwright'); const fs = require('fs');
+const { chromium } = require('playwright'); const fs = require('fs'); const crypto = require('crypto');
+// Login state: encrypted file in repo (state.enc), key in STATE_KEY secret. The cloud renews and re-saves it.
+const KEY = process.env.STATE_KEY ? Buffer.from(process.env.STATE_KEY, 'hex') : null;
+function loadState() {
+  if (KEY && fs.existsSync('state.enc')) { const [iv, tag, data] = fs.readFileSync('state.enc', 'utf8').trim().split('.').map(x => Buffer.from(x, 'base64'));
+    const d = crypto.createDecipheriv('aes-256-gcm', KEY, iv); d.setAuthTag(tag); return JSON.parse(Buffer.concat([d.update(data), d.final()]).toString()); }
+  return JSON.parse(process.env.STATE_JSON || fs.readFileSync('state.json', 'utf8'));
+}
+function encState(obj) { const iv = crypto.randomBytes(12); const c = crypto.createCipheriv('aes-256-gcm', KEY, iv);
+  const data = Buffer.concat([c.update(JSON.stringify(obj)), c.final()]); return [iv, c.getAuthTag(), data].map(x => x.toString('base64')).join('.'); }
+async function saveState(ctx) { if (!KEY || !process.env.GITHUB_ACTIONS) return;
+  try { const st = await ctx.storageState(); st.cookies = st.cookies.filter(c => /contentrewards\.com|vistasocial\.com/.test(c.domain));
+    st.origins = st.origins.filter(o => /contentrewards\.com|vistasocial\.com/.test(o.origin)); fs.writeFileSync('state.enc', encState(st));
+    require('child_process').execSync('git add state.enc && git commit -qm state && (git push -q || (git pull -q --rebase && git push -q))', { stdio: 'ignore' }); } catch {} }
 const CAMPAIGNS = [
   { name: 'KreekCraft', url: 'https://contentrewards.com/c/campaigns/2eaa14fb-6927-4136-897e-b096e0d907d6',
     profiles: [847128,847051,847137,847115,847138,847050,847139,847116,847119,847117,847120,847118,847121] },
@@ -17,7 +30,7 @@ async function vistaLinks(ctx) {
   const r = await ctx.request.post('https://vistasocial.com/api/publishing/calendar/get-calendar', { data: {
     timezone: 'America/Los_Angeles', centralDate: '', dateFrom: pt(now - 864e5), dateTo: pt(now + 864e5),
     profileIds: CAMPAIGNS.flatMap(c=>c.profiles).join(','), entityIds: ENTITY_IDS } });
-  if (!r.ok()) throw new Error(`Vista ${r.status()} - Vista login expired? re-run setup`);
+  const ct = r.headers()['content-type'] || ''; if (!r.ok() || !ct.includes('json')) throw new Error(`Vista login expired (status ${r.status()}) - needs new sign-in`);
   const ev = (await r.json()).events || [];
   const ids = new Set(CAMPAIGNS.flatMap(c=>c.profiles).map(String));
   nextDue = Math.min(Infinity, ...ev.filter(e => ids.has(String(e.profile_gid)) && /SCHEDULED|PROCESSING|APPROVED|REVIEW/.test(e.status))
@@ -47,13 +60,14 @@ async function submit(p, c, link) {
 (async () => {
   const cdp = process.env.CDP;
   const b = cdp ? await chromium.connectOverCDP(cdp) : await chromium.launch();
-  const ctx = cdp ? b.contexts()[0] : await b.newContext({ storageState: JSON.parse(process.env.STATE_JSON || fs.readFileSync('state.json','utf8')) });
+  if (process.argv[2] === 'encrypt') { fs.writeFileSync('state.enc', encState(JSON.parse(fs.readFileSync(process.argv[3],'utf8')))); console.log('encrypted'); process.exit(0); }
+  const ctx = cdp ? b.contexts()[0] : await b.newContext({ storageState: loadState() });
   const p = await ctx.newPage(); p.setDefaultTimeout(15000); let fail = false;
   const end = Date.now() + (+process.env.LOOP_MIN || 0) * 60e3;
   let tick = 0;
   do {
     try {
-      const posts = await vistaLinks(ctx); if (!(++tick % 10)) console.log(new Date().toISOString(), 'alive, live posts:', posts.length, 'logged:', done.size);
+      const posts = await vistaLinks(ctx); if (!(++tick % 10)) { await saveState(ctx); } if (!(tick % 10)) console.log(new Date().toISOString(), 'alive, live posts:', posts.length, 'logged:', done.size);
       for (const post of posts) {
         const c = CAMPAIGNS.find(c => c.profiles.includes(post.profile)); if (!c || done.has(post.link)) continue;
         if (DRY) { out.push(`DRY would submit to ${c.name}: ${post.link}`); done.add(post.link); continue; }
@@ -64,6 +78,7 @@ async function submit(p, c, link) {
     if (Date.now() < end) { await p.waitForTimeout(30000); if (out.length > 200) out.splice(0, 100); }
   } while (Date.now() < end);
   if (!out.length) out.push('nothing new');
+  if (!cdp) await saveState(ctx);
   console.log(out.join('\n')); fs.writeFileSync('report.txt', out.join('\n'));
   await p.close(); if (!cdp) await b.close(); process.exit(fail ? 1 : 0);
 })();
