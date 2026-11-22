@@ -1,4 +1,4 @@
-// Cloud bot: every 30s, read posts that went live (last 36h) from Vista Social,
+// Cloud bot: every 30s, read posts that went live in the last 30 min from Vista Social,
 // then paste each link into the matching Content Rewards campaign. Never resubmits a link (submitted.log).
 const { chromium } = require('playwright'); const fs = require('fs'); const crypto = require('crypto');
 // Login state: encrypted file in repo (state.enc), key in STATE_KEY secret. The cloud renews and re-saves it.
@@ -47,17 +47,18 @@ const CAMPAIGNS = [
   { name: 'Brett', url: 'https://contentrewards.com/c/campaigns/954cf1f2-1a69-4f0f-b46c-18a9dfddb219', profiles: [850136] },
 ];
 const ENTITY_IDS = '3f972620-e50a-11f1-a33e-81c466c1e067,cf51f540-e1d3-11f1-905a-196ceb9e190b,a4893300-e1d3-11f1-b7d5-835374bce5b6,dddc08d0-e1d3-11f1-a025-4d6af26820fd,5027a300-e1d3-11f1-988c-89194c44b0b5';
-// Look back 36h so posts that went live while the bot was logged out still get submitted once it is back.
-// submitted.log stops repeats; Content Rewards also answers "already submitted" for anything sent by hand.
-const WINDOW_MIN = +process.env.WINDOW_MIN || 36 * 60, DRY = process.env.DRY_RUN === '1';
-const tries = {}; const MAX_TRIES = 3; // per run, so one bad link can't be retried every 30s for 36h
+// Content Rewards only accepts a clip for 30 minutes after it was posted, so only look at posts younger than that.
+// (Anything missed while logged out can't be submitted later - that's why login alerts matter.)
+const WINDOW_MIN = +process.env.WINDOW_MIN || 30, DRY = process.env.DRY_RUN === '1';
+const TOO_OLD = /submitted for 30 minutes|can't be submitted|too old|expired|older than/i;
+const tries = {}; const MAX_TRIES = 3; // per run, so one bad link can't be retried every 30s
 // Email the owner (GitHub notifies on new issues) when a login dies; close the issue when it works again.
 const ALERT = 'cr-bot ALERT: login expired';
 const alerted = {};
 function alertOn(what, msg) { if (alerted[what] || !process.env.GITHUB_ACTIONS || !process.env.GH_TOKEN) return; alerted[what] = true;
   try { if (sh(`gh issue list --state open --search "in:title ${ALERT}" --json number --jq length`) !== '0') return;
     const owner = (process.env.GITHUB_REPOSITORY || '').split('/')[0];
-    fs.writeFileSync('alert.md', `@${owner} the bot can't submit posts right now.\n\n**${msg}**\n\nFix: on your Mac, double-click **Fix Vista Login** on your Desktop and log in if asked. The bot picks up the new login by itself within about 5 minutes and then submits every post it missed in the last 36 hours. This issue closes itself when it's working again.`);
+    fs.writeFileSync('alert.md', `@${owner} the bot can't submit posts right now.\n\n**${msg}**\n\nFix: on your Mac, double-click **Fix Vista Login** on your Desktop and log in if asked. The bot picks up the new login by itself within about 5 minutes. Content Rewards only accepts clips for 30 minutes after posting, so posts that go live while the bot is logged out cannot be submitted later - fix it fast. This issue closes itself when it's working again.`);
     sh(`gh issue create --title "${ALERT} (${what})" --body-file alert.md`); } catch (e) { console.log('alert failed', e.message); } }
 // First success of a run also closes alerts left open by earlier runs (alerted[what] starts undefined).
 function alertOff(what) { if (alerted[what] === false) return; alerted[what] = false;
@@ -190,7 +191,8 @@ async function submit(p, c, link) {
           const line = `${new Date().toISOString()} ${c.name} ${post.link}`; myLog.push(line); fs.appendFileSync(LOG, line + '\n'); gitSync('log', LOG); out.push(`SUBMITTED to ${c.name}: ${post.link}`); }
         catch (e) { fail = true; const msg = e.message.split('\n')[0]; out.push(`FAILED ${c.name} ${post.link}: ${msg}`); await p.screenshot({ path: `fail-${Date.now()}.png` }).catch(()=>{});
           if (/logged out/.test(msg)) { alertOn('Content Rewards', 'Content Rewards logged the bot out.'); break; }
-          tries[post.link] = (tries[post.link] || 0) + 1; if (tries[post.link] >= MAX_TRIES) done.add(post.link); } // next run tries again
+          tries[post.link] = (tries[post.link] || 0) + 1;
+          if (tries[post.link] >= MAX_TRIES || (TOO_OLD.test(msg) && Date.now() - post.live > 25 * 60e3)) done.add(post.link); } // a fresh post may just not be visible to CR yet, so keep trying those
       }
     } catch (e) { fail = true; out.push('FAILED: ' + e.message.split('\n')[0]); }
     if (Date.now() < end) { await p.waitForTimeout(30000); if (out.length > 200) out.splice(0, 100); }
