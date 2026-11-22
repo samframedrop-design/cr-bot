@@ -1,4 +1,4 @@
-// Cloud bot: every run, read posts that went live in the last 30 min from Vista Social,
+// Cloud bot: every 30s, read posts that went live (last 36h) from Vista Social,
 // then paste each link into the matching Content Rewards campaign. Never resubmits a link (submitted.log).
 const { chromium } = require('playwright'); const fs = require('fs'); const crypto = require('crypto');
 // Login state: encrypted file in repo (state.enc), key in STATE_KEY secret. The cloud renews and re-saves it.
@@ -10,10 +10,35 @@ function loadState() {
 }
 function encState(obj) { const iv = crypto.randomBytes(12); const c = crypto.createCipheriv('aes-256-gcm', KEY, iv);
   const data = Buffer.concat([c.update(JSON.stringify(obj)), c.final()]); return [iv, c.getAuthTag(), data].map(x => x.toString('base64')).join('.'); }
-async function saveState(ctx) { if (!KEY || !process.env.GITHUB_ACTIONS) return;
+// Only save the login when Vista accepted it on the last check. Saving a dead login would overwrite a fresh one
+// uploaded by relogin (this is what kept the bot broken after Vista ended its session on Nov 21).
+let vistaOK = false;
+function sh(cmd) { return require('child_process').execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); }
+const LOG = 'submitted.log'; const myLog = []; // log lines written by this run, re-applied if we have to reset to the remote
+let lastStateText = fs.existsSync('state.enc') ? fs.readFileSync('state.enc', 'utf8') : '';
+// Make the local copy match GitHub again (never gets stuck mid-rebase), keeping this run's submitted.log lines.
+function resetToRemote() {
+  try { sh('git rebase --abort'); } catch {}
+  try { sh('git fetch -q origin main && git reset -q --hard origin/main'); } catch { return; }
+  const cur = fs.existsSync(LOG) ? fs.readFileSync(LOG, 'utf8') : '';
+  const miss = myLog.filter(l => !cur.includes(l.split(' ').pop()));
+  if (miss.length) fs.appendFileSync(LOG, (cur && !cur.endsWith('\n') ? '\n' : '') + miss.join('\n') + '\n');
+}
+function gitSync(msg, files) { if (!process.env.GITHUB_ACTIONS) return;
+  try { sh(`git add -f ${files} && (git diff --cached --quiet || git commit -qm ${msg}) && git push -q`); return; } catch {}
+  resetToRemote(); // someone else pushed (another run, or a new login upload): keep theirs, re-add only our log lines
+  try { sh(`git add -f ${LOG} && (git diff --cached --quiet || git commit -qm log) && git push -q`); } catch {} }
+async function saveState(ctx) { if (!KEY || !process.env.GITHUB_ACTIONS || !vistaOK) return;
   try { const st = await ctx.storageState(); st.cookies = st.cookies.filter(c => /contentrewards\.com|vistasocial\.com/.test(c.domain));
-    st.origins = st.origins.filter(o => /contentrewards\.com|vistasocial\.com/.test(o.origin)); fs.writeFileSync('state.enc', encState(st));
-    require('child_process').execSync('git add state.enc && git commit -qm state && (git push -q || (git pull -q --rebase && git push -q))', { stdio: 'ignore' }); } catch {} }
+    st.origins = st.origins.filter(o => /contentrewards\.com|vistasocial\.com/.test(o.origin)); lastStateText = encState(st); fs.writeFileSync('state.enc', lastStateText);
+    gitSync('state', 'state.enc'); } catch {} }
+// While logged out: pick up a fresh state.enc uploaded by "Fix Vista Login" without restarting the run.
+async function reloadState(ctx) { if (!KEY || !process.env.GITHUB_ACTIONS) return false;
+  resetToRemote(); try { sh(`git add -f ${LOG} && (git diff --cached --quiet || git commit -qm log) && git push -q`); } catch {}
+  const now = fs.existsSync('state.enc') ? fs.readFileSync('state.enc', 'utf8') : '';
+  if (!now || now === lastStateText) return false; lastStateText = now;
+  try { const st = loadState(); await ctx.clearCookies(); await ctx.addCookies(st.cookies); console.log(new Date().toISOString(), 'loaded new login from state.enc'); return true; }
+  catch (e) { console.log('reload failed', e.message); return false; } }
 const CAMPAIGNS = [
   { name: 'KreekCraft', url: 'https://contentrewards.com/c/campaigns/2eaa14fb-6927-4136-897e-b096e0d907d6',
     profiles: [847128,847051,847137,847115,847138,847050,847139,847116,847119,847117,847120,847118,847121] },
@@ -22,23 +47,42 @@ const CAMPAIGNS = [
   { name: 'Brett', url: 'https://contentrewards.com/c/campaigns/954cf1f2-1a69-4f0f-b46c-18a9dfddb219', profiles: [850136] },
 ];
 const ENTITY_IDS = '3f972620-e50a-11f1-a33e-81c466c1e067,cf51f540-e1d3-11f1-905a-196ceb9e190b,a4893300-e1d3-11f1-b7d5-835374bce5b6,dddc08d0-e1d3-11f1-a025-4d6af26820fd,5027a300-e1d3-11f1-988c-89194c44b0b5';
-const WINDOW_MIN = 28, DRY = process.env.DRY_RUN === '1';
-const LOG = 'submitted.log'; const done = new Set(fs.existsSync(LOG) ? fs.readFileSync(LOG,'utf8').split('\n').map(l=>l.split(' ').pop()) : []);
+// Look back 36h so posts that went live while the bot was logged out still get submitted once it is back.
+// submitted.log stops repeats; Content Rewards also answers "already submitted" for anything sent by hand.
+const WINDOW_MIN = +process.env.WINDOW_MIN || 36 * 60, DRY = process.env.DRY_RUN === '1';
+const tries = {}; const MAX_TRIES = 3; // per run, so one bad link can't be retried every 30s for 36h
+// Email the owner (GitHub notifies on new issues) when a login dies; close the issue when it works again.
+const ALERT = 'cr-bot ALERT: login expired';
+const alerted = {};
+function alertOn(what, msg) { if (alerted[what] || !process.env.GITHUB_ACTIONS || !process.env.GH_TOKEN) return; alerted[what] = true;
+  try { if (sh(`gh issue list --state open --search "in:title ${ALERT}" --json number --jq length`) !== '0') return;
+    const owner = (process.env.GITHUB_REPOSITORY || '').split('/')[0];
+    fs.writeFileSync('alert.md', `@${owner} the bot can't submit posts right now.\n\n**${msg}**\n\nFix: on your Mac, double-click **Fix Vista Login** on your Desktop and log in if asked. The bot picks up the new login by itself within about 5 minutes and then submits every post it missed in the last 36 hours. This issue closes itself when it's working again.`);
+    sh(`gh issue create --title "${ALERT} (${what})" --body-file alert.md`); } catch (e) { console.log('alert failed', e.message); } }
+// First success of a run also closes alerts left open by earlier runs (alerted[what] starts undefined).
+function alertOff(what) { if (alerted[what] === false) return; alerted[what] = false;
+  if (!process.env.GITHUB_ACTIONS || !process.env.GH_TOKEN) return;
+  try { for (const n of sh(`gh issue list --state open --search "in:title ${ALERT} (${what})" --json number --jq ".[].number"`).split('\n').filter(Boolean))
+    sh(`gh issue close ${n} --comment "Working again - login is back and posts are being submitted."`); } catch {} }
+const done = new Set(fs.existsSync(LOG) ? fs.readFileSync(LOG,'utf8').split('\n').map(l=>l.split(' ').pop()) : []);
 const out = []; let nextDue = Infinity; const _push = out.push.bind(out); out.push = (...a) => { a.forEach(x=>console.log(new Date().toISOString(), x)); return _push(...a); }; const pt = d => new Date(d).toLocaleDateString('en-CA', { timeZone: 'America/Los_Angeles' });
 
 let TAGS = []; // [{id,name}]
 async function vistaLinks(ctx) {
   const now = Date.now();
-  let entityIds = ENTITY_IDS;
-  try { const e = await (await ctx.request.get('https://vistasocial.com/api/entities?page=calendar')).json(); if (e.entities?.length) entityIds = e.entities.map(x => x.id).join(','); } catch {}
+  // Ask for exactly the profiles that exist right now. Vista returns NO posts at all if the list holds a profile
+  // that was removed (847128 did this), and an empty list also returns nothing - so never use a hard-coded list.
+  let entityIds = ENTITY_IDS, profileIds = '';
+  const er = await ctx.request.get('https://vistasocial.com/api/entities?page=calendar');
+  if (!er.ok() || !(er.headers()['content-type'] || '').includes('json')) throw new Error(`Vista login expired (status ${er.status()}) - needs new sign-in`);
+  const e = await er.json().catch(() => ({}));
+  if (e.entities?.length) { entityIds = e.entities.map(x => x.id).join(','); profileIds = [...new Set(e.entities.flatMap(x => (x.profiles || []).map(p => p.id)))].join(','); }
+  if (!profileIds) throw new Error('Vista login expired (no profiles visible) - needs new sign-in');
   try { const t = await (await ctx.request.get('https://vistasocial.com/api/tag?surface=PUBLICATION')).json(); if (Array.isArray(t)) TAGS = t.map(x => ({ id: x._id, name: x.name })); } catch {}
-  const body = { timezone: 'America/Los_Angeles', centralDate: '', dateFrom: pt(now - 864e5), dateTo: pt(now + 864e5), entityIds };
-  let r = await ctx.request.post('https://vistasocial.com/api/publishing/calendar/get-calendar', { data: { ...body, profileIds: '' } });
-  let ct = r.headers()['content-type'] || '';
-  let ev = (r.ok() && ct.includes('json')) ? ((await r.json()).events || []).filter(e => e.profile_gid) : [];
-  if (!ev.length) { r = await ctx.request.post('https://vistasocial.com/api/publishing/calendar/get-calendar', { data: { ...body, profileIds: CAMPAIGNS.flatMap(c=>c.profiles).join(',') } });
-    ct = r.headers()['content-type'] || ''; if (!r.ok() || !ct.includes('json')) throw new Error(`Vista login expired (status ${r.status()}) - needs new sign-in`);
-    ev = (await r.json()).events || []; }
+  const body = { timezone: 'America/Los_Angeles', centralDate: '', dateFrom: pt(now - WINDOW_MIN * 60e3 - 864e5), dateTo: pt(now + 864e5), entityIds, profileIds };
+  const r = await ctx.request.post('https://vistasocial.com/api/publishing/calendar/get-calendar', { data: body });
+  if (!r.ok() || !(r.headers()['content-type'] || '').includes('json')) throw new Error(`Vista login expired (status ${r.status()}) - needs new sign-in`);
+  const ev = ((await r.json()).events || []).filter(e => e.profile_gid);
   return ev.filter(e => e.status === 'PUBLISHED' && e.result?.published_link)
     .map(e => { const link = e.result.published_link; const tt = link.match(/tiktok\.com\/@[^/]+\/video\/(\d+)/);
       if (/tiktok\.com/.test(link) && !tt) return null;
@@ -66,7 +110,6 @@ async function pickCampaign(p, post) {
   for (const t of post.tags) { try { const c = await campaignForTag(p, t); if (c) return c; } catch (e) { out.push(`tag lookup error "${t}": ${e.message.split('\n')[0]}`); await p.screenshot({ path: `tagfail-${Date.now()}.png` }).catch(()=>{}); } }
   return CAMPAIGNS.find(c => c.profiles.includes(post.profile)) || null; // untagged: old fixed list
 }
-function saveLog() { if (!process.env.GITHUB_ACTIONS) return; try { require('child_process').execSync('git add -f submitted.log && git commit -qm log && (git push -q || (git pull -q --rebase && git push -q))', { stdio: 'ignore' }); } catch {} }
 const POPUP_BTN = /^(not now|skip( for now)?|maybe later|no,? thanks|dismiss|close|decline|reject( all)?|got it|ok(ay)?|continue|later|cancel)$/i;
 // Close anything that is not the submit box: cookie banners, Discord prompts, announcements, tours.
 async function closePopups(p, keep) {
@@ -130,15 +173,24 @@ async function submit(p, c, link) {
   const p = await ctx.newPage(); p.setDefaultTimeout(15000); let fail = false;
   for (const sig of ['SIGTERM','SIGINT']) process.on(sig, async () => { await saveState(ctx); process.exit(1); });
   const end = Date.now() + (+process.env.LOOP_MIN || 0) * 60e3;
-  let tick = 0;
+  let tick = 0, vistaFails = 0;
   do {
-    try {
-      const posts = await vistaLinks(ctx); if (!(++tick % 10)) { await saveState(ctx); } if (!(tick % 10)) console.log(new Date().toISOString(), 'alive, live posts:', posts.length, 'logged:', done.size);
+    let posts = null;
+    try { posts = await vistaLinks(ctx); vistaOK = true; vistaFails = 0; alertOff('Vista'); }
+    catch (e) { vistaOK = false; vistaFails++; fail = true;
+      if (vistaFails === 1 || !(vistaFails % 120)) out.push(`FAILED (${vistaFails}x in a row): ` + e.message.split('\n')[0]);
+      if (vistaFails >= 4) alertOn('Vista', 'Vista Social logged the bot out (Vista ends website logins after about 12 hours).'); // 4 in a row = not a one-off server hiccup
+      if (!(vistaFails % 10) && await reloadState(ctx)) out.push('Picked up a new login from state.enc - retrying'); }
+    if (posts) try {
+      if (!(++tick % 10)) { await saveState(ctx); console.log(new Date().toISOString(), 'alive, live posts:', posts.length, 'logged:', done.size); }
       for (const post of posts) {
         if (done.has(post.link)) continue; const c = await pickCampaign(p, post); if (!c) { out.push(`no campaign for ${post.link} (tags: ${post.tags.join(',')||'none'})`); done.add(post.link); continue; }
         if (DRY) { out.push(`DRY would submit to ${c.name}: ${post.link}`); done.add(post.link); continue; }
-        try { const res = await submit(p, c, post.link); done.add(post.link); if (res === 'already') out.push('(Content Rewards says already submitted)'); fs.appendFileSync(LOG, `${new Date().toISOString()} ${c.name} ${post.link}\n`); saveLog(); out.push(`SUBMITTED to ${c.name}: ${post.link}`); }
-        catch (e) { fail = true; out.push(`FAILED ${c.name} ${post.link}: ${e.message.split('\n')[0]}`); await p.screenshot({ path: `fail-${Date.now()}.png` }).catch(()=>{}); }
+        try { const res = await submit(p, c, post.link); done.add(post.link); alertOff('Content Rewards'); if (res === 'already') out.push('(Content Rewards says already submitted)');
+          const line = `${new Date().toISOString()} ${c.name} ${post.link}`; myLog.push(line); fs.appendFileSync(LOG, line + '\n'); gitSync('log', LOG); out.push(`SUBMITTED to ${c.name}: ${post.link}`); }
+        catch (e) { fail = true; const msg = e.message.split('\n')[0]; out.push(`FAILED ${c.name} ${post.link}: ${msg}`); await p.screenshot({ path: `fail-${Date.now()}.png` }).catch(()=>{});
+          if (/logged out/.test(msg)) { alertOn('Content Rewards', 'Content Rewards logged the bot out.'); break; }
+          tries[post.link] = (tries[post.link] || 0) + 1; if (tries[post.link] >= MAX_TRIES) done.add(post.link); } // next run tries again
       }
     } catch (e) { fail = true; out.push('FAILED: ' + e.message.split('\n')[0]); }
     if (Date.now() < end) { await p.waitForTimeout(30000); if (out.length > 200) out.splice(0, 100); }
