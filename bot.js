@@ -12,7 +12,42 @@ function encState(obj) { const iv = crypto.randomBytes(12); const c = crypto.cre
   const data = Buffer.concat([c.update(JSON.stringify(obj)), c.final()]); return [iv, c.getAuthTag(), data].map(x => x.toString('base64')).join('.'); }
 // Only save the login when Vista accepted it on the last check. Saving a dead login would overwrite a fresh one
 // uploaded by relogin (this is what kept the bot broken after Vista ended its session on Nov 21).
-let vistaOK = false;
+let vistaOK = false, crOK = true;
+// Vista API key (encrypted in vista.enc with the same STATE_KEY). With it the bot reads posts through Vista's MCP
+// server, which never logs out - the website login is only a fallback.
+const VKEY = (() => { try { if (process.env.VISTA_API_KEY) return process.env.VISTA_API_KEY.trim();
+  if (KEY && fs.existsSync('vista.enc')) { const [iv, tag, data] = fs.readFileSync('vista.enc', 'utf8').trim().split('.').map(x => Buffer.from(x, 'base64'));
+    const d = crypto.createDecipheriv('aes-256-gcm', KEY, iv); d.setAuthTag(tag); return Buffer.concat([d.update(data), d.final()]).toString().trim(); } } catch (e) { console.log('vista.enc unreadable', e.message); } return null; })();
+const MCP_URL = 'https://mcp.vistasocial.com/mcp'; let mcpSid = null, mcpId = 1;
+async function mcpRpc(body) {
+  const r = await fetch(MCP_URL, { method: 'POST', body: JSON.stringify(body), signal: AbortSignal.timeout(60000),
+    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'x-api-key': VKEY, ...(mcpSid ? { 'mcp-session-id': mcpSid } : {}) } });
+  const sid = r.headers.get('mcp-session-id'); if (sid) mcpSid = sid;
+  const t = await r.text(); if (!r.ok) throw new Error(`Vista MCP ${r.status}: ${t.slice(0, 120)}`);
+  if (body.id === undefined) return null;
+  const j = JSON.parse(t.includes('data:') ? t.split('\n').filter(l => l.startsWith('data:')).map(l => l.slice(5)).pop() : t);
+  if (j.error) throw new Error('Vista MCP error: ' + JSON.stringify(j.error).slice(0, 150)); return j.result; }
+async function mcpTool(name, args, retry = true) {
+  try { if (!mcpSid) { await mcpRpc({ jsonrpc: '2.0', id: mcpId++, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'cr-bot', version: '2' } } });
+      await mcpRpc({ jsonrpc: '2.0', method: 'notifications/initialized' }); }
+    const res = await mcpRpc({ jsonrpc: '2.0', id: mcpId++, method: 'tools/call', params: { name, arguments: args } });
+    const txt = (res.content || []).map(c => c.text || '').join(''); if (res.isError) throw new Error(`Vista ${name}: ${txt.slice(0, 150)}`);
+    return JSON.parse(txt); }
+  catch (e) { if (retry) { mcpSid = null; return mcpTool(name, args, false); } throw e; } }
+let mcpProfiles = null, mcpProfilesAt = 0;
+async function vistaLinksMCP() {
+  const now = Date.now();
+  if (!mcpProfiles || now - mcpProfilesAt > 30 * 60e3) { const pr = await mcpTool('findProfiles', { fields: ['id'], limit: 200 });
+    mcpProfiles = (Array.isArray(pr) ? pr : pr.profiles || pr.rows || []).map(x => x.id ?? x[0]).filter(Boolean); mcpProfilesAt = now; }
+  if (!mcpProfiles.length) throw new Error('Vista MCP returned no profiles');
+  const day = d => new Date(d).toISOString().slice(0, 10);
+  const r = await mcpTool('listPosts', { profile_ids: mcpProfiles, status: ['PUBLISHED'], dateFrom: day(now - 864e5), dateTo: day(now + 864e5), timezone: 'Etc/UTC', sort: 'newest_first', limit: 150 });
+  const rows = (r.rows || []).map(x => Object.fromEntries(r.columns.map((c, i) => [c, x[i]])));
+  return rows.filter(e => e.published_link).map(e => { const link = e.published_link; const tt = link.match(/tiktok\.com\/@[^/]+\/video\/(\d+)/);
+      if (/tiktok\.com/.test(link) && !tt) return null;
+      const live = tt ? Number(BigInt(tt[1]) >> 32n) * 1000 : Date.parse(e.publish_at + 'Z');
+      return { profile: +e.profile_id, link, live, tags: e.tags || [] }; }).filter(Boolean)
+    .filter(e => now - e.live < WINDOW_MIN * 60e3 && now - e.live > -60e3); }
 function sh(cmd) { return require('child_process').execSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); }
 const LOG = 'submitted.log'; const myLog = []; // log lines written by this run, re-applied if we have to reset to the remote
 let lastStateText = fs.existsSync('state.enc') ? fs.readFileSync('state.enc', 'utf8') : '';
@@ -28,7 +63,7 @@ function gitSync(msg, files) { if (!process.env.GITHUB_ACTIONS) return;
   try { sh(`git add -f ${files} && (git diff --cached --quiet || git commit -qm ${msg}) && git push -q`); return; } catch {}
   resetToRemote(); // someone else pushed (another run, or a new login upload): keep theirs, re-add only our log lines
   try { sh(`git add -f ${LOG} && (git diff --cached --quiet || git commit -qm log) && git push -q`); } catch {} }
-async function saveState(ctx) { if (!KEY || !process.env.GITHUB_ACTIONS || !vistaOK) return;
+async function saveState(ctx) { if (!KEY || !process.env.GITHUB_ACTIONS || !crOK || !(vistaOK || VKEY)) return;
   try { const st = await ctx.storageState(); st.cookies = st.cookies.filter(c => /contentrewards\.com|vistasocial\.com/.test(c.domain));
     st.origins = st.origins.filter(o => /contentrewards\.com|vistasocial\.com/.test(o.origin)); lastStateText = encState(st); fs.writeFileSync('state.enc', lastStateText);
     gitSync('state', 'state.enc'); } catch {} }
@@ -177,8 +212,10 @@ async function submit(p, c, link) {
   let tick = 0, vistaFails = 0;
   do {
     let posts = null;
-    try { posts = await vistaLinks(ctx); vistaOK = true; vistaFails = 0; alertOff('Vista'); }
-    catch (e) { vistaOK = false; vistaFails++; fail = true;
+    let mcpErr = null;
+    if (VKEY) try { posts = await vistaLinksMCP(); vistaFails = 0; alertOff('Vista'); } catch (e) { mcpErr = e; if (!(tick % 20)) console.log('MCP failed, trying website login:', e.message); }
+    if (!posts) try { posts = await vistaLinks(ctx); vistaOK = true; vistaFails = 0; alertOff('Vista'); }
+    catch (e) { vistaOK = false; vistaFails++; fail = true; if (mcpErr) e.message = `${mcpErr.message} | ${e.message}`;
       if (vistaFails === 1 || !(vistaFails % 120)) out.push(`FAILED (${vistaFails}x in a row): ` + e.message.split('\n')[0]);
       if (vistaFails >= 4) alertOn('Vista', 'Vista Social logged the bot out (Vista ends website logins after about 12 hours).'); // 4 in a row = not a one-off server hiccup
       if (!(vistaFails % 10) && await reloadState(ctx)) out.push('Picked up a new login from state.enc - retrying'); }
@@ -187,10 +224,10 @@ async function submit(p, c, link) {
       for (const post of posts) {
         if (done.has(post.link)) continue; const c = await pickCampaign(p, post); if (!c) { out.push(`no campaign for ${post.link} (tags: ${post.tags.join(',')||'none'})`); done.add(post.link); continue; }
         if (DRY) { out.push(`DRY would submit to ${c.name}: ${post.link}`); done.add(post.link); continue; }
-        try { const res = await submit(p, c, post.link); done.add(post.link); alertOff('Content Rewards'); if (res === 'already') out.push('(Content Rewards says already submitted)');
+        try { const res = await submit(p, c, post.link); done.add(post.link); crOK = true; alertOff('Content Rewards'); if (res === 'already') out.push('(Content Rewards says already submitted)');
           const line = `${new Date().toISOString()} ${c.name} ${post.link}`; myLog.push(line); fs.appendFileSync(LOG, line + '\n'); gitSync('log', LOG); out.push(`SUBMITTED to ${c.name}: ${post.link}`); }
         catch (e) { fail = true; const msg = e.message.split('\n')[0]; out.push(`FAILED ${c.name} ${post.link}: ${msg}`); await p.screenshot({ path: `fail-${Date.now()}.png` }).catch(()=>{});
-          if (/logged out/.test(msg)) { alertOn('Content Rewards', 'Content Rewards logged the bot out.'); break; }
+          if (/logged out/.test(msg)) { crOK = false; alertOn('Content Rewards', 'Content Rewards logged the bot out.'); break; }
           tries[post.link] = (tries[post.link] || 0) + 1;
           if (tries[post.link] >= MAX_TRIES || (TOO_OLD.test(msg) && Date.now() - post.live > 25 * 60e3)) done.add(post.link); } // a fresh post may just not be visible to CR yet, so keep trying those
       }
