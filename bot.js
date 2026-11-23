@@ -209,6 +209,7 @@ async function submit(p, c, link) {
   const p = await ctx.newPage(); p.setDefaultTimeout(15000); let fail = false;
   for (const sig of ['SIGTERM','SIGINT']) process.on(sig, async () => { await saveState(ctx); process.exit(1); });
   const end = Date.now() + (+process.env.LOOP_MIN || 0) * 60e3;
+  console.log(new Date().toISOString(), 'Vista source:', VKEY ? 'MCP with API key (no logout)' : 'website login only');
   let tick = 0, vistaFails = 0;
   do {
     let posts = null;
